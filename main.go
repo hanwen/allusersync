@@ -15,12 +15,14 @@
 package main
 
 import (
+	"context"
 	"crypto/sha1"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	git "github.com/go-git/go-git/v5"
@@ -31,6 +33,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/storer"
 	"github.com/hanwen/allusersync/gitutil"
 	gerrit "github.com/hanwen/go-gerrit"
+	"golang.org/x/time/rate"
 )
 
 type AccountInfo struct {
@@ -38,7 +41,8 @@ type AccountInfo struct {
 	extIDs  []gerrit.AccountExternalIdInfo
 }
 
-func getAccountDetails(cl *gerrit.Client, id string) (*AccountInfo, error) {
+func getAccountDetails(lim *rate.Limiter, cl *gerrit.Client, id string) (*AccountInfo, error) {
+	lim.Wait(context.Background())
 	details, reply, err := cl.Accounts.GetAccountDetails(id)
 
 	if reply != nil && reply.StatusCode == 404 {
@@ -48,6 +52,7 @@ func getAccountDetails(cl *gerrit.Client, id string) (*AccountInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	lim.Wait(context.Background())
 	extIDs, _, err := cl.Accounts.GetAccountExternalIDs(id)
 	if err != nil {
 		return nil, err
@@ -60,12 +65,11 @@ func getAccountDetails(cl *gerrit.Client, id string) (*AccountInfo, error) {
 }
 
 type RefUpdate struct {
-	// TODO - OldID plumbing.Hash
 	NewID plumbing.Hash
 }
 
 type RefTransaction struct {
-	updates map[string]*RefUpdate
+	updates map[plumbing.ReferenceName]*RefUpdate
 }
 
 func UpdateRepo(ref storer.ReferenceStorer, tr *RefTransaction) error {
@@ -93,8 +97,8 @@ func newSig() object.Signature {
 
 func saveAccountDetails(infos []*AccountInfo, repo *git.Repository) error {
 	s := newSig()
-	extRefName := "refs/meta/external-ids"
-	extRef, err := repo.Reference(plumbing.ReferenceName(extRefName), true)
+	extRefName := plumbing.ReferenceName("refs/meta/external-ids")
+	extRef, err := repo.Reference(extRefName, true)
 	var extCommit *object.Commit
 	if err == plumbing.ErrReferenceNotFound {
 		err = nil
@@ -113,7 +117,7 @@ func saveAccountDetails(infos []*AccountInfo, repo *git.Repository) error {
 	var newEntries []object.TreeEntry
 
 	trans := &RefTransaction{
-		updates: map[string]*RefUpdate{},
+		updates: map[plumbing.ReferenceName]*RefUpdate{},
 	}
 
 	for _, inf := range infos {
@@ -128,6 +132,7 @@ func saveAccountDetails(infos []*AccountInfo, repo *git.Repository) error {
 		}
 
 		// TODO - read previous state, and drop associated external ids.
+
 		id, err = gitutil.SaveTree(repo.Storer, []object.TreeEntry{
 			{
 				Name: "account.config",
@@ -138,21 +143,45 @@ func saveAccountDetails(infos []*AccountInfo, repo *git.Repository) error {
 			return err
 		}
 
+		uidRefName := plumbing.ReferenceName(fmt.Sprintf("refs/users/%02d/%d", inf.account.AccountID%100, inf.account.AccountID))
+		uidRef, err := repo.Reference(uidRefName, true)
+		var oldUserCommit *object.Commit
+		if err == plumbing.ErrReferenceNotFound {
+			err = nil
+		}
+		if err != nil {
+			return err
+		}
+		if uidRef != nil {
+			oldUserCommit, err = repo.CommitObject(uidRef.Hash())
+			if err != nil {
+				return err
+			}
+		}
+
 		// TODO - could work registration date into Author/committer timestamp
-		id, err = gitutil.SaveCommit(
-			repo.Storer, &object.Commit{
-				Author:    s,
-				Committer: s,
-				Message:   "update account",
-				TreeHash:  id,
-				// TODO - set parent.
-			})
+		uidCommit := &object.Commit{
+			Author:    s,
+			Committer: s,
+			Message:   "update account",
+			TreeHash:  id,
+		}
+
+		if oldUserCommit != nil {
+			if oldUserCommit.TreeHash == uidCommit.TreeHash {
+				continue
+			}
+			uidCommit.ParentHashes = []plumbing.Hash{oldUserCommit.Hash}
+
+			// TODO - work out differences, and schedule old external IDs for deletion.
+		}
+
+		id, err = gitutil.SaveCommit(repo.Storer, uidCommit)
 		if err != nil {
 			return err
 		}
 
-		uidRef := fmt.Sprintf("refs/users/%02d/%d", inf.account.AccountID%100, inf.account.AccountID)
-		trans.updates[uidRef] = &RefUpdate{NewID: id}
+		trans.updates[uidRefName] = &RefUpdate{NewID: id}
 
 		for _, e := range inf.extIDs {
 			cfg := &config.Config{}
@@ -166,6 +195,7 @@ func saveAccountDetails(infos []*AccountInfo, repo *git.Repository) error {
 				return err
 			}
 
+			// TODO - support sharded notemap?
 			newEntries = append(newEntries, object.TreeEntry{
 				Name: fmt.Sprintf("%x", sha1.Sum([]byte(e.Identity))),
 				Mode: filemode.Regular,
@@ -202,7 +232,9 @@ func saveAccountDetails(infos []*AccountInfo, repo *git.Repository) error {
 		return err
 	}
 
-	trans.updates[string(extRefName)] = &RefUpdate{NewID: id}
+	if extCommit == nil || extCommit.TreeHash != newExtCommit.TreeHash {
+		trans.updates[extRefName] = &RefUpdate{NewID: id}
+	}
 
 	return UpdateRepo(repo.Storer, trans)
 }
@@ -210,6 +242,9 @@ func saveAccountDetails(infos []*AccountInfo, repo *git.Repository) error {
 func main() {
 	url := flag.String("url", "http://localhost:8080/", "")
 	repoDir := flag.String("repo", "", "all-users repo")
+
+	basicAuth := flag.String("basic", "", "USER:PASSWORD for basic auth.")
+	cookieAuth := flag.String("cookie", "", "value for the 'o' auth cookie. Use for googlesource.com")
 	flag.Parse()
 	if *repoDir == "" {
 		log.Fatal("must specify --repo")
@@ -229,13 +264,32 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// must have view_database privilege.
-	client.Authentication.SetBasicAuth("admin", "XqDG4yB3JMAIVnrp7BJDC3Q3luc2GIk+UBYUqHH2GQ")
+	if *basicAuth != "" {
+		fields := strings.Split(*basicAuth, ":")
+		client.Authentication.SetBasicAuth(fields[0], fields[1])
+	} else if *cookieAuth != "" {
+		client.Authentication.SetCookieAuth("o", *cookieAuth)
+	}
 
-	// Get all public projects
+	caps, _, err := client.Accounts.ListAccountCapabilities("self", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if !caps.AccessDatabase {
+		log.Fatal("need accessDatabase capability.")
+	}
+
 	var infos []*AccountInfo
+
+	// googlesource.com caps at 8 QPS for logged-in users.
+	lim := rate.NewLimiter(8, 4)
+
+	// TODO - use account query to fetch AccountInfo data in bulk,
+	// so we can get account details for many IDs in one call.
+	// Right now, we have to probe all integer account IDs.
 	for _, id := range flag.Args() {
-		val, err := getAccountDetails(client, id)
+		val, err := getAccountDetails(lim, client, id)
 		if val == nil {
 			continue
 		}
@@ -243,6 +297,9 @@ func main() {
 			log.Fatal(err)
 		}
 		infos = append(infos, val)
+		if len(infos)%100 == 0 {
+			fmt.Printf("%s ... ", id)
+		}
 	}
 
 	if len(infos) == 0 {

@@ -3,8 +3,8 @@ module github.com/hanwen/allusersync
 go 1.22
 
 require (
-	github.com/hanwen/go-gerrit v0.0.0-20230816143958-807bc28cb80f
 	github.com/go-git/go-git/v5 v5.8.1
+	github.com/hanwen/go-gerrit v0.0.0-20230816143958-807bc28cb80f
 )
 
 require (
@@ -28,6 +28,7 @@ require (
 	golang.org/x/mod v0.8.0 // indirect
 	golang.org/x/net v0.12.0 // indirect
 	golang.org/x/sys v0.10.0 // indirect
+	golang.org/x/time v0.3.0 // indirect
 	golang.org/x/tools v0.6.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 )
