@@ -229,6 +229,7 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// must have view_database privilege.
 	client.Authentication.SetBasicAuth("admin", "XqDG4yB3JMAIVnrp7BJDC3Q3luc2GIk+UBYUqHH2GQ")
 
 	// Get all public projects
